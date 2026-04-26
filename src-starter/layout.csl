@@ -1,0 +1,103 @@
+// layout.csl — Top-K k-NN kernel layout
+//
+// Defines the P×P PE grid, four routing colors for the 2D reduce, and the
+// host-visible memcpy symbols. The compute lives in pe_program.csl.
+//
+// Compile-time params (set by --params on cslc):
+//   P            — grid dimension (PE grid is P×P)
+//   d_dim        — vector dimension
+//   rows_per_pe  — ceil(N / P²); per-PE shard length, padded to this size
+//   K            — number of nearest neighbors to return
+
+param P: i16;
+param d_dim: i16;
+param rows_per_pe: i16;
+param K: i16;
+
+// Routing colors. WSE-2 has a 32-slot color/task-id namespace; memcpy
+// reserves several. We use 4 user colors at the low end (0..3); pe_program.csl
+// uses task IDs starting at 8 to stay clear of memcpy's reserved range.
+const c_row_dist: color = @get_color(0);  // row reduce: distance wavelets
+const c_row_idx:  color = @get_color(1);  // row reduce: index wavelets
+const c_col_dist: color = @get_color(2);  // col reduce: distance wavelets
+const c_col_idx:  color = @get_color(3);  // col reduce: index wavelets
+
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = P, .height = P });
+
+layout {
+  @set_rectangle(P, P);
+
+  // -------------------------------------------------------------------------
+  // Per-PE program instantiation.
+  // -------------------------------------------------------------------------
+  for (@range(i16, P)) |px| {
+    for (@range(i16, P)) |py| {
+      @set_tile_code(px, py, "pe_program.csl", .{
+        .memcpy_params = memcpy.get_params(px),
+        .px           = px,
+        .py           = py,
+        .P            = P,
+        .d_dim        = d_dim,
+        .rows_per_pe  = rows_per_pe,
+        .K            = K,
+        .c_row_dist   = c_row_dist,
+        .c_row_idx    = c_row_idx,
+        .c_col_dist   = c_col_dist,
+        .c_col_idx    = c_col_idx,
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Routing.
+  //
+  // Row reduce: each row independently merges east → west into column 0.
+  //   PE (P-1, y): RAMP → WEST                       (source)
+  //   PE (0..P-2, y) for px in (1..P-2): EAST → WEST + RAMP   (forward + tap)
+  //   PE (0, y): EAST → RAMP                         (sink for that row)
+  //
+  // Col reduce: only column 0 carries it, merging south → north into (0,0).
+  //   PE (0, P-1): RAMP → NORTH
+  //   PE (0, 1..P-2): SOUTH → NORTH + RAMP
+  //   PE (0, 0):   SOUTH → RAMP                      (final sink)
+  // -------------------------------------------------------------------------
+  for (@range(i16, P)) |px| {
+    for (@range(i16, P)) |py| {
+
+      // ---- row colors (active on every row) ----
+      if (px == P - 1) {
+        @set_color_config(px, py, c_row_dist, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+        @set_color_config(px, py, c_row_idx,  .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+      } else if (px == 0) {
+        @set_color_config(px, py, c_row_dist, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+        @set_color_config(px, py, c_row_idx,  .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+      } else {
+        @set_color_config(px, py, c_row_dist, .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} } });
+        @set_color_config(px, py, c_row_idx,  .{ .routes = .{ .rx = .{EAST}, .tx = .{WEST, RAMP} } });
+      }
+
+      // ---- col colors (only column 0 is active) ----
+      if (px == 0) {
+        if (py == P - 1) {
+          @set_color_config(px, py, c_col_dist, .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+          @set_color_config(px, py, c_col_idx,  .{ .routes = .{ .rx = .{RAMP}, .tx = .{NORTH} } });
+        } else if (py == 0) {
+          @set_color_config(px, py, c_col_dist, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+          @set_color_config(px, py, c_col_idx,  .{ .routes = .{ .rx = .{SOUTH}, .tx = .{RAMP} } });
+        } else {
+          @set_color_config(px, py, c_col_dist, .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH, RAMP} } });
+          @set_color_config(px, py, c_col_idx,  .{ .routes = .{ .rx = .{SOUTH}, .tx = .{NORTH, RAMP} } });
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Host-visible symbols (memcpy / SdkRuntime).
+  // -------------------------------------------------------------------------
+  @export_name("D_shard",          [*]f32, true);
+  @export_name("q_data",           [*]f32, true);
+  @export_name("result_indices",   [*]i32, true);  // valid only on PE (0,0)
+  @export_name("result_distances", [*]f32, true);  // valid only on PE (0,0)
+  @export_name("compute", fn()void);
+}

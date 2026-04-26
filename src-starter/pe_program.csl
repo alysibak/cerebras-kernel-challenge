@@ -1,0 +1,378 @@
+// pe_program.csl — per-PE Top-K k-NN compute and 2D reduce.
+//
+// Phase 1 (compute):
+//   For each of `rows_per_pe` rows in the local shard, compute squared L2
+//   distance to q. Pad rows (idx >= N) get distance = +inf so they never
+//   win a tie. Maintain a K-element max-heap keyed lex by (dist, idx).
+//
+// Phase 2 (row reduce, EAST → WEST):
+//   PE (P-1, y) sends its sorted top-K west.
+//   PE (px, y) for 0 < px < P-1 receives K pairs, merges with local, sends
+//     the merged top-K west.
+//   PE (0, y) receives K pairs, merges with local, holds the row winner.
+//
+// Phase 3 (col reduce on column 0, SOUTH → NORTH):
+//   PE (0, P-1) sends its row-winner top-K north.
+//   PE (0, py) for 0 < py < P-1 receives, merges, sends north.
+//   PE (0, 0) receives the final K pairs, merges, writes to result buffers,
+//     unblocks memcpy readback.
+//
+// Tie-break: every comparison uses (dist, idx) lexicographic order. Equal
+// distances resolve by smaller original index. The merge is commutative
+// under this total order (see DESIGN.md §4) so output is deterministic.
+
+param memcpy_params: comptime_struct;
+
+param px: i16;
+param py: i16;
+param P: i16;
+param d_dim: i16;
+param rows_per_pe: i16;
+param K: i16;
+
+param c_row_dist: color;
+param c_row_idx:  color;
+param c_col_dist: color;
+param c_col_idx:  color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// ---------------------------------------------------------------------------
+// Task IDs. Memcpy reserves task IDs in the low range; we start at 8 to be
+// safe. Check `topic-11-collectives/layout.csl` if any of these collide.
+// ---------------------------------------------------------------------------
+const TID_COMPUTE:        local_task_id = @get_local_task_id(8);
+const TID_RECV_ROW_DIST:  data_task_id  = @get_data_task_id(c_row_dist);
+const TID_RECV_ROW_IDX:   data_task_id  = @get_data_task_id(c_row_idx);
+const TID_RECV_COL_DIST:  data_task_id  = @get_data_task_id(c_col_dist);
+const TID_RECV_COL_IDX:   data_task_id  = @get_data_task_id(c_col_idx);
+const TID_AFTER_ROW:      local_task_id = @get_local_task_id(9);
+const TID_AFTER_COL:      local_task_id = @get_local_task_id(10);
+
+// ---------------------------------------------------------------------------
+// Per-PE constants (compile-time).
+// ---------------------------------------------------------------------------
+const pe_id:      i16 = py * P + px;       // row-major flatten
+const row_offset: i32 = @as(i32, pe_id) * @as(i32, rows_per_pe);
+const N_total:    i32 = @as(i32, P) * @as(i32, P) * @as(i32, rows_per_pe);
+
+const POS_INF: f32 = 0x1.0p127;            // any value larger than any real squared distance
+
+// ---------------------------------------------------------------------------
+// Storage.
+// ---------------------------------------------------------------------------
+var D_shard: [rows_per_pe * d_dim]f32 = @zeros([rows_per_pe * d_dim]f32);
+var q_data:  [d_dim]f32                = @zeros([d_dim]f32);
+
+// Local top-K, kept as a max-heap during compute and as a sorted array
+// (ascending) for transmission. heap_dist[0] is the worst kept (max).
+var heap_dist: [K]f32 = @zeros([K]f32);
+var heap_idx:  [K]i32 = @zeros([K]i32);
+var heap_size: i16    = 0;
+
+// Receive buffers for one merge step.
+var recv_dist: [K]f32 = @zeros([K]f32);
+var recv_idx:  [K]i32 = @zeros([K]i32);
+var recv_dist_count: i16 = 0;
+var recv_idx_count:  i16 = 0;
+
+// Final results (only valid on PE (0,0)). memcpy reads from here.
+var result_indices:   [K]i32 = @zeros([K]i32);
+var result_distances: [K]f32 = @zeros([K]f32);
+
+// ---------------------------------------------------------------------------
+// Pointer exports for memcpy. The host writes D_shard / q_data into these,
+// and reads result_* back from PE (0,0).
+// ---------------------------------------------------------------------------
+var ptr_D_shard:          [*]f32 = &D_shard;
+var ptr_q_data:           [*]f32 = &q_data;
+var ptr_result_indices:   [*]i32 = &result_indices;
+var ptr_result_distances: [*]f32 = &result_distances;
+
+// ---------------------------------------------------------------------------
+// Lex compare: returns true iff (a_d, a_i) < (b_d, b_i).
+// ---------------------------------------------------------------------------
+fn lt(a_d: f32, a_i: i32, b_d: f32, b_i: i32) bool {
+  if (a_d < b_d) return true;
+  if (a_d > b_d) return false;
+  return a_i < b_i;
+}
+
+// ---------------------------------------------------------------------------
+// Max-heap helpers, keyed by (dist, idx) — root = worst kept.
+// ---------------------------------------------------------------------------
+fn heap_swap(i: i16, j: i16) void {
+  const td = heap_dist[i]; heap_dist[i] = heap_dist[j]; heap_dist[j] = td;
+  const ti = heap_idx[i];  heap_idx[i]  = heap_idx[j];  heap_idx[j]  = ti;
+}
+
+fn heap_sift_up(idx: i16) void {
+  var i: i16 = idx;
+  while (i > 0) {
+    const parent: i16 = (i - 1) / 2;
+    // swap if child > parent under lex (we want max at root)
+    if (lt(heap_dist[parent], heap_idx[parent], heap_dist[i], heap_idx[i])) {
+      heap_swap(parent, i);
+      i = parent;
+    } else {
+      break;
+    }
+  }
+}
+
+fn heap_sift_down(start: i16, size: i16) void {
+  var i: i16 = start;
+  while (true) {
+    const l: i16 = 2 * i + 1;
+    const r: i16 = 2 * i + 2;
+    var biggest: i16 = i;
+    if (l < size and lt(heap_dist[biggest], heap_idx[biggest], heap_dist[l], heap_idx[l])) {
+      biggest = l;
+    }
+    if (r < size and lt(heap_dist[biggest], heap_idx[biggest], heap_dist[r], heap_idx[r])) {
+      biggest = r;
+    }
+    if (biggest == i) break;
+    heap_swap(i, biggest);
+    i = biggest;
+  }
+}
+
+fn heap_push(d: f32, ix: i32) void {
+  heap_dist[heap_size] = d;
+  heap_idx[heap_size]  = ix;
+  heap_size += 1;
+  heap_sift_up(heap_size - 1);
+}
+
+// Replace root with (d, ix) if (d, ix) is smaller under lex, then sift down.
+fn heap_replace_if_smaller(d: f32, ix: i32) void {
+  if (lt(d, ix, heap_dist[0], heap_idx[0])) {
+    heap_dist[0] = d;
+    heap_idx[0]  = ix;
+    heap_sift_down(0, K);
+  }
+}
+
+// Convert max-heap to a sorted ascending array via repeated extract-max.
+// After this, heap_dist[0..K] is sorted ascending (smallest at index 0).
+fn heap_to_sorted() void {
+  // Standard heap-sort: while size > 1, swap root with last, shrink, sift.
+  // After shrinking to size=1, we have ascending order from index 0.
+  var sz: i16 = K;
+  while (sz > 1) {
+    heap_swap(0, sz - 1);
+    sz -= 1;
+    heap_sift_down(0, sz);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: distance pass + local top-K.
+// ---------------------------------------------------------------------------
+fn compute_local_topk() void {
+  for (@range(i16, rows_per_pe)) |r| {
+    const global_idx: i32 = row_offset + @as(i32, r);
+
+    // Padded rows (idx >= N) get +inf distance and idx = N_total so they
+    // never displace a real row in any tie.
+    var d2: f32 = 0.0;
+    if (global_idx >= N_total) {
+      d2 = POS_INF;
+    } else {
+      var acc: f32 = 0.0;
+      const base: i16 = r * d_dim;
+      for (@range(i16, d_dim)) |k| {
+        const diff: f32 = D_shard[base + k] - q_data[k];
+        acc = acc + diff * diff;
+      }
+      d2 = acc;
+    }
+
+    const idx_for_tiebreak: i32 = if (global_idx >= N_total) N_total else global_idx;
+
+    if (heap_size < K) {
+      heap_push(d2, idx_for_tiebreak);
+    } else {
+      heap_replace_if_smaller(d2, idx_for_tiebreak);
+    }
+  }
+  // Sort heap into ascending array for transmission.
+  heap_to_sorted();
+}
+
+// ---------------------------------------------------------------------------
+// Merge two sorted-ascending K-arrays under lex order, keeping the smallest K.
+// Inputs: heap_* (length K, ascending) and recv_* (length K, ascending).
+// Output: heap_* overwritten with merged top-K, ascending.
+// ---------------------------------------------------------------------------
+var merge_buf_dist: [K]f32 = @zeros([K]f32);
+var merge_buf_idx:  [K]i32 = @zeros([K]i32);
+
+fn merge_sorted_topk() void {
+  var i: i16 = 0;
+  var j: i16 = 0;
+  var o: i16 = 0;
+  while (o < K) {
+    if (i >= K) {
+      merge_buf_dist[o] = recv_dist[j]; merge_buf_idx[o] = recv_idx[j]; j += 1;
+    } else if (j >= K) {
+      merge_buf_dist[o] = heap_dist[i]; merge_buf_idx[o] = heap_idx[i]; i += 1;
+    } else if (lt(heap_dist[i], heap_idx[i], recv_dist[j], recv_idx[j])) {
+      merge_buf_dist[o] = heap_dist[i]; merge_buf_idx[o] = heap_idx[i]; i += 1;
+    } else {
+      merge_buf_dist[o] = recv_dist[j]; merge_buf_idx[o] = recv_idx[j]; j += 1;
+    }
+    o += 1;
+  }
+  for (@range(i16, K)) |k| {
+    heap_dist[k] = merge_buf_dist[k];
+    heap_idx[k]  = merge_buf_idx[k];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wavelet send/receive plumbing.
+//
+// We use one f32 fabric output DSD on c_row_dist / c_col_dist for distances,
+// and one i32 fabric output DSD on c_row_idx / c_col_idx for indices. Each
+// send pushes K wavelets on each color (2K wavelets total per merge step).
+// ---------------------------------------------------------------------------
+
+fn send_topk_row() void {
+  // Send heap_dist[0..K] on c_row_dist, heap_idx[0..K] on c_row_idx.
+  const out_d = @get_dsd(fabout_dsd, .{
+    .extent = K, .fabric_color = c_row_dist, .output_queue = @get_output_queue(0),
+  });
+  const out_i = @get_dsd(fabout_dsd, .{
+    .extent = K, .fabric_color = c_row_idx,  .output_queue = @get_output_queue(1),
+  });
+  const local_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K} -> heap_dist[i] });
+  const local_i = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K} -> heap_idx[i]  });
+  @mov32(out_d, local_d, .{ .async = true });
+  @mov32(out_i, local_i, .{ .async = true });
+}
+
+fn send_topk_col() void {
+  const out_d = @get_dsd(fabout_dsd, .{
+    .extent = K, .fabric_color = c_col_dist, .output_queue = @get_output_queue(2),
+  });
+  const out_i = @get_dsd(fabout_dsd, .{
+    .extent = K, .fabric_color = c_col_idx,  .output_queue = @get_output_queue(3),
+  });
+  const local_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K} -> heap_dist[i] });
+  const local_i = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K} -> heap_idx[i]  });
+  @mov32(out_d, local_d, .{ .async = true });
+  @mov32(out_i, local_i, .{ .async = true });
+}
+
+// Data-task handlers: each wavelet on c_row_dist deposits one f32 into
+// recv_dist[recv_dist_count++]. Once both counters hit K, we kick the
+// row-merge continuation.
+task recv_row_dist(d: f32) void {
+  recv_dist[recv_dist_count] = d;
+  recv_dist_count += 1;
+  if (recv_dist_count == K and recv_idx_count == K) @activate(TID_AFTER_ROW);
+}
+task recv_row_idx(i: i32) void {
+  recv_idx[recv_idx_count] = i;
+  recv_idx_count += 1;
+  if (recv_dist_count == K and recv_idx_count == K) @activate(TID_AFTER_ROW);
+}
+task recv_col_dist(d: f32) void {
+  recv_dist[recv_dist_count] = d;
+  recv_dist_count += 1;
+  if (recv_dist_count == K and recv_idx_count == K) @activate(TID_AFTER_COL);
+}
+task recv_col_idx(i: i32) void {
+  recv_idx[recv_idx_count] = i;
+  recv_idx_count += 1;
+  if (recv_dist_count == K and recv_idx_count == K) @activate(TID_AFTER_COL);
+}
+
+// ---------------------------------------------------------------------------
+// State-machine continuations.
+// ---------------------------------------------------------------------------
+fn reset_recv() void {
+  recv_dist_count = 0;
+  recv_idx_count  = 0;
+}
+
+task after_row_merge() void {
+  merge_sorted_topk();
+  reset_recv();
+  // px == 0 finishes the row reduce; column 0 then begins the col reduce.
+  if (px == 0) {
+    if (py == P - 1) {
+      // Top of column 0 has the only data — start the col stream.
+      send_topk_col();
+    }
+    // Other column-0 PEs wait for col-reduce data; their handlers will fire
+    // when wavelets arrive.
+  } else if (px > 0) {
+    // Forward our merged result west.
+    send_topk_row();
+  }
+}
+
+task after_col_merge() void {
+  merge_sorted_topk();
+  reset_recv();
+  if (py == 0 and px == 0) {
+    // We are the final sink — copy heap into result buffers for memcpy.
+    for (@range(i16, K)) |k| {
+      result_distances[k] = heap_dist[k];
+      result_indices[k]   = heap_idx[k];
+    }
+    // SdkRuntime is satisfied as soon as compute() returns; the memcpy
+    // pull from host happens after compute completes. Nothing else to do.
+  } else {
+    // Forward north on column 0.
+    send_topk_col();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point: host calls compute() via SdkRuntime RPC after memcpy of D, q.
+// ---------------------------------------------------------------------------
+task compute_task() void {
+  compute_local_topk();
+
+  // Kick off the row reduce. The east-most PE in each row is the source.
+  if (px == P - 1) {
+    if (P == 1) {
+      // Degenerate 1×1 grid — local top-K is the answer.
+      for (@range(i16, K)) |k| {
+        result_distances[k] = heap_dist[k];
+        result_indices[k]   = heap_idx[k];
+      }
+    } else {
+      send_topk_row();
+    }
+  }
+  // Other PEs wait passively; their data-task handlers fire on arrival.
+}
+
+fn compute() void {
+  @activate(TID_COMPUTE);
+}
+
+// ---------------------------------------------------------------------------
+// Bind tasks to their IDs / colors.
+// ---------------------------------------------------------------------------
+comptime {
+  @bind_local_task(compute_task,    TID_COMPUTE);
+  @bind_local_task(after_row_merge, TID_AFTER_ROW);
+  @bind_local_task(after_col_merge, TID_AFTER_COL);
+
+  @bind_data_task(recv_row_dist, TID_RECV_ROW_DIST);
+  @bind_data_task(recv_row_idx,  TID_RECV_ROW_IDX);
+  @bind_data_task(recv_col_dist, TID_RECV_COL_DIST);
+  @bind_data_task(recv_col_idx,  TID_RECV_COL_IDX);
+
+  @export_symbol(ptr_D_shard,          "D_shard");
+  @export_symbol(ptr_q_data,           "q_data");
+  @export_symbol(ptr_result_indices,   "result_indices");
+  @export_symbol(ptr_result_distances, "result_distances");
+  @export_symbol(compute,              "compute");
+}
